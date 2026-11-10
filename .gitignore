@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# 运行产物
+example_output/
+
+# 数据（原始与清洗结果都不入库）
+data/
+*.npz
+*.npy
+*.mat
+*.edf
+
+# 系统/编辑器
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
