@@ -1,73 +1,42 @@
 # iEEG Preprocess Toolkit
 
-一套面向颅内脑电（iEEG / ECoG / sEEG）的**可复现预处理协议库 + 桌面 UI + 九宫格质量控制**工具。
+A reproducible preprocessing protocol for intracranial electrophysiology (iEEG / ECoG / sEEG),
+with a desktop UI and a nine-panel quality-control (QC) suite.
 
-核心思路：预处理不是"点几下就完事"的黑箱，而是一份**可记录、可对比、可判读的协议**。本工具把每一
-步做过的处理、用过的全部参数写成可读的协议档案，并用"处理前 vs 处理后"的九张 QC 图回答两个问题：
-该做的有没有做干净（工频、共模、坏道、伪迹），不该动的神经信号有没有被改坏（保留度、频段、波形）。
+The core idea: preprocessing should not be a black box. Every run records **what was done and with
+which parameters** in a human-readable protocol report, and a before/after QC dashboard answers two
+questions - did the pipeline remove what it should (line noise, common mode, bad channels,
+artifacts), and did it damage what it should keep (signal retention, spectral content, waveforms)?
 
-## 目录结构
+## Features
 
-```text
-ieeg-preprocess-toolkit/
-├── preprocessing.py        # 核心函数族：全部预处理步骤、协议编排、QC 指标与绘图
-├── utils.py                # 轻量工具：数据加载、特征、相位、时间顺序切分评估、绘图
-├── preprocess_ui.py        # Tkinter 桌面 UI（单文件，依赖同目录的 preprocessing.py）
-├── example_run.py          # 无 UI 的命令行示例（生成 demo 数据 -> 跑协议 -> 出 QC 图与报告）
-├── layouts/
-│   └── demo_layout.xlsx    # 演示用电极排布表（32 通道，两块 4x4 栅格）
-└── README.md
-```
+- **Full preprocessing chain** with swappable methods at every step and a fixed, artifact-safe
+  ordering (DC removal before filtering, stimulation-artifact removal before any temporal filter,
+  windowed detrending without boundary steps).
+- **Bad-channel detection** with five criteria (`mad`, `ptp`, `flatness`, `corr`, `ica`), union or
+  majority-voting modes, per-criterion reporting, and manual additions that never override
+  automatic results.
+- **Drop-safe index bookkeeping**: deleting channels remaps bipolar pairs, channel groups, white
+  matter contacts, and the adjacency matrix; every output row carries an `out_ch_map` back to the
+  original channels (or bipolar pairs), so QC metrics and downstream analysis never misalign.
+- **Global bad-channel locking for multi-trial data**: one mask estimated over the whole session
+  and applied to every trial, so outputs always stack into a consistent 3-D tensor.
+- **Eight re-referencing schemes**: common average (CAR), median, grouped CAR, shaft-local CAR,
+  white-matter, bipolar, Laplacian, and none, with Laplacian isolated-node fallback.
+- **Line-noise removal** with four algorithms (IIR notch, FIR bandstop, sliding-window spectral
+  regression, FFT interpolation repair) supporting a base frequency, harmonics, and arbitrary
+  custom frequency lists (e.g., 60 Hz monitor, 65/78/140 Hz device noise).
+- **Artifact masks** for slow motion drift and high-frequency EMG (60-180 Hz), using robust
+  median/MAD z-scores, plus interictal epileptiform discharge (IED) detection with a three-part
+  criterion (envelope z-score + amplitude + first-derivative steepness).
+- **Reproducible protocol reports** (`render_protocol_report`) with the full parameter snapshot,
+  bad-channel details, mask coverages, and output-to-input channel mapping.
+- **Nine-panel QC dashboard** (`plot_protocol_qc`) and multi-protocol comparison
+  (`plot_config_comparison`) to select the right method combination for each dataset.
+- **Tkinter desktop UI** with three-column layout, bad-channel confirmation gating, batch
+  processing, and `.npz` export.
 
-## 功能总览
-
-`preprocessing.py` 提供从原始数据到特征提取前的完整预处理，固定顺序（防振铃 + 防阶跃设计）：
-
-```text
-0 去直流(dc_method) -> 1 坏通道 -> 2 刺激伪迹(先于一切时域滤波)
--> 3 频率滤波 -> 4 工频(基频+谐波+自定义频点) -> 5 运动/EMG 掩码
--> 6 重参考(8 种) -> 7 IED(可选) -> 8 重采样 -> 9 事件分段 -> 10 段级质检
-```
-
-每一步都提供多种可切换方法，见下表：
-
-| 步骤 | 可选方法 | 关键参数 | 何时选择 |
-| --- | --- | --- | --- |
-| 0 去直流 `dc_method` | `none` / `mean` / `median` | — | 有直流偏置/极化漂移选 `median`（对刺激脉冲稳健） |
-| 1 坏通道 `bad_detect` | `mad` / `ptp` / `flatness` / `corr` / `ica`，`+` 并集，`vote:` 多数投票 | `min_votes`（三取二 / 四取三） | 推荐投票；每种判据结果都输出供复核 |
-| 1 坏通道处置 `bad_handle` | `none` / `mask` / `interpolate` / `drop` | — | 保守选 `mask`；`drop` 会剔除并自动重映射双极对/分组/邻接矩阵 |
-| 2 刺激伪迹 `stim` | `none` / `template_subtract` / `interpolate` / `blank` | `stim_pre`, `stim_post` | 电刺激必须处理且先于一切时域滤波；短伪迹选 `interpolate` |
-| 3 频率滤波 `filter_method` | `none` / `highpass` / `lowpass` / `bandpass` / `detrend` | `hp_cutoff`, `lp_cutoff`, `detrend_seg`, `detrend_order` | 高通去慢漂移；`detrend` 为汉宁窗 50% 重叠滑动拟合，无窗口边界阶跃 |
-| 4 工频 `line_method` | `none` / `iir_notch` / `fir_notch` / `cleanline` / `fft_interp` | `line_f0`, `line_q`, `line_width`, `line_win`, `line_harmonics`, `line_freqs` | 短记录稳定选 `iir_notch`；长记录相位漂移选 `cleanline`；介意 PSD 深谷选 `fft_interp`；`line_freqs` 支持自定义多频点（如显示器 60Hz、设备 65/78/140Hz） |
-| 5 运动伪迹 `motion` | `none` / `mask` / `interpolate` | `motion_win`, `motion_z`, `motion_lf`, `motion_max_gap` | 掩码传播到分段质检，不置零避免阶跃振铃；z 分数用中位数/MAD 稳健统计 |
-| 5 EMG `emg` | `none` / `mask` | `emg_lo`, `emg_hi`, `emg_z`, `emg_win` | 颞叶底面/外侧电极的咀嚼肌污染（60-180Hz 宽带） |
-| 6 重参考 `reference` | `none` / `car` / `median` / `group_car` / `shaft_car` / `white_matter` / `bipolar` / `laplacian` | 见下 | 单一植入物选 `car`；多栅格/多脑区必须 `group_car`；sEEG 针道选 `shaft_car` 或 `bipolar`；有白质触点选 `white_matter`；二维栅格局灶分析选 `laplacian` |
-| 7 IED `ied` | `none` / `report` / `exclude` | `ied_z` | 发作间期放电检测（包络 z + 幅值 + 一阶差分陡峭度三判据）；`exclude` 会剔除重叠试次 |
-| 8 重采样 `resample_to` | `None` 或目标采样率 | — | 多相重采样，自动同步事件坐标 |
-| 9 分段 | `events` / `tmin` / `tmax` / `baseline` | — | 与伪迹掩码重叠的试次自动剔除 |
-| 10 段级质检 | `ptp_max` / `qc_var_z` | — | 剔除峰峰/方差异常片段 |
-
-### 重参考的选用要点
-
-- **CAR（共同平均）**：减所有好通道均值，温和的空间高通，去共模、留局部梯度，单通道解码/电极级特征首选。
-- **group_car（分组共同平均）**：多块电极各自减本组均值，避免把一块电极的共模灌进另一块。
-- **median（中位数参考）**：与 CAR 同理但更稳健，适合共模本身被个别高幅通道污染的数据。
-- **bipolar（双极）**：沿针道相邻差分，临床 sEEG/癫痫与 HFO 检测主力，改变通道数与幅值地形。
-- **laplacian（拉普拉斯）**：减最近邻平均，强空间高通，突出局灶活动，适合高 gamma 定位/CSD 地形，不适合低频振荡与解码类任务（会给相邻通道注入负相关、幅值大幅下降，均属预期）。
-- **shaft_car / white_matter**：sEEG 专属，针道内均值 / 白质触点参考。
-
-## 质量控制（QC 九宫格）
-
-`plot_protocol_qc` 输出 3x3 面板（9 张，英文标注）：PSD 前后叠加、波形前后叠加、工频峰比
-（50/100/150Hz）、逐通道信号保留度（按 `out_ch_map` 对齐，drop/双极不串行）、各频段功率保留比、
-残余共模（秩 1 方差解释率）、空间相干性（带符号平均 r）、逐通道幅值（坏道标红）、伪迹覆盖/坏通道摘要。
-
-`plot_config_comparison` 对多套协议输出对比面板。判读原则：先看工频干净与波形没坏，再看信号保留，
-再用共模/空间相干性确认参考方式符合下游分析，最后复查坏道与伪迹。UI 内置"QC 图解读"按钮，逐张说明。
-
-## 快速开始
-
-### 1. 环境
+## Installation
 
 ```bash
 conda create -n bci_env python=3.10 -y
@@ -75,37 +44,102 @@ conda activate bci_env
 pip install numpy scipy pandas scikit-learn matplotlib openpyxl
 ```
 
-### 2. 桌面 UI
+Python 3.9+ is required.
+
+## Quick start
+
+### Desktop UI
 
 ```bash
 conda activate bci_env
 python preprocess_ui.py
 ```
 
-三栏布局：左栏步骤 0-3（去直流、坏通道确认门控、刺激伪迹、工频），中栏步骤 4-7（运动/EMG、
-IED、重参考、重采样、分段），右栏加载数据 / 运行协议 / QC 图解读 / 报告 / 导出。
+- **Run protocol**: for 2-D data, one full run; for 3-D (trials x channels x time) data, a fast
+  evaluation over the first 30 trials plus the nine-panel QC figure of the first trial.
+- **Full batch**: processes every trial with the globally locked bad-channel mask.
+- **Export cleaned result**: saves `X_clean`, `fs`, `bad_channels`, `out_ch_map`, and the protocol
+  report to a `.npz` archive.
 
-- **运行协议**：二维数据完整跑一次；三维数据用前 30 个 trial 做指标评估 + 第 1 个 trial 画 QC 图
-  （快速试跑，判断参数是否合适）。
-- **全量批处理**：对全部 trial 执行完整预处理，坏通道在全会话上全局锁定（同一套通道对所有 trial 生效，
-  保证 drop/双极后各试次维度一致）。
-- **导出清洗结果**：把结果保存为 `.npz`（`X_clean`、`fs`、`bad_channels`、`out_ch_map`、协议报告）。
-- 重参考选 `group_car` / `laplacian` 时加载电极排布表 `.xlsx`（表内连通块自动成为分组、块内构建
-  4 邻接；首列为针道名时自动按针道断开邻接）；`bipolar` / `shaft_car` 需加载通道名 `.txt`。
+Spatial parameters are loaded from an electrode-layout workbook (`.xlsx`): connected blocks become
+groups for grouped CAR and 4-neighbor adjacency for the Laplacian; shaft names in the first column
+automatically break adjacency between shafts. Bipolar and shaft CAR additionally need a channel
+name list (`.txt`, one name per line).
 
-### 3. 命令行示例
+### Command line
 
 ```bash
 conda activate bci_env
 python example_run.py
 ```
 
-生成 32 通道合成 LFP（含 50/100Hz 工频、刺激伪迹、运动漂移、坏通道），跑一套协议，输出协议报告、
-QC 九宫格图和清洗后的 `.npz`，可用于无 GUI 环境或批处理脚本。
+Generates a 32-channel synthetic LFP (50/100 Hz line noise, stimulation artifacts, motion drift,
+bad channels), runs the protocol, and writes the protocol report, the QC dashboard, and the cleaned
+`.npz` archive into `example_output/`.
 
-## 核心 API
+## Pipeline order
+
+```text
+0 DC removal (dc_method)           1 bad channels
+2 stimulation artifacts            3 frequency filtering
+(before any temporal filter)       (after stimulation artifacts)
+4 line noise                       5 motion / EMG masks
+(base + harmonics + custom list)
+6 re-referencing                   7 IED detection (optional)
+8 resampling (optional)            9 epoch segmentation
+10 epoch QC
+```
+
+| Step | Methods | Key parameters | When to choose |
+| --- | --- | --- | --- |
+| 0 DC removal `dc_method` | `none` / `mean` / `median` | - | `median` is robust to stimulation pulses |
+| 1 Bad channels `bad_detect` | `mad` / `ptp` / `flatness` / `corr` / `ica`, `+` union, `vote:` majority | `min_votes` | voting recommended; all per-criterion results are reported |
+| 1 Handling `bad_handle` | `none` / `mask` / `interpolate` / `drop` | - | `mask` is conservative; `drop` remaps pairs/groups/adjacency automatically |
+| 2 Stimulation `stim` | `none` / `template_subtract` / `interpolate` / `blank` | `stim_pre`, `stim_post` | must precede all temporal filters; `interpolate` for short pulses |
+| 3 Filtering `filter_method` | `none` / `highpass` / `lowpass` / `bandpass` / `detrend` | `hp_cutoff`, `lp_cutoff`, `detrend_seg`, `detrend_order` | `detrend` uses Hann-weighted 50% overlap, no window-boundary steps |
+| 4 Line noise `line_method` | `none` / `iir_notch` / `fir_notch` / `cleanline` / `fft_interp` | `line_f0`, `line_q`, `line_width`, `line_win`, `line_harmonics`, `line_freqs` | `cleanline` for phase drift; `fft_interp` avoids PSD notches; `line_freqs` for arbitrary device noise |
+| 5 Motion `motion` | `none` / `mask` / `interpolate` | `motion_win`, `motion_z`, `motion_lf`, `motion_max_gap` | masks propagate to epoch QC; median/MAD robust z-scores |
+| 5 EMG `emg` | `none` / `mask` | `emg_lo`, `emg_hi`, `emg_z`, `emg_win` | 60-180 Hz broadband muscle artifacts on temporal/basal contacts |
+| 6 Reference `reference` | `none` / `car` / `median` / `group_car` / `shaft_car` / `white_matter` / `bipolar` / `laplacian` | see below | choose by montage and analysis goal |
+| 7 IED `ied` | `none` / `report` / `exclude` | `ied_z` | `exclude` drops overlapping epochs |
+| 8 Resampling `resample_to` | `None` or target rate | - | polyphase resampling, event coordinates synced |
+| 9 Epoching | `events` / `tmin` / `tmax` / `baseline` | - | epochs overlapping artifact masks are dropped |
+| 10 Epoch QC | `ptp_max` / `qc_var_z` | - | removes peak-to-peak / variance outliers |
+
+### Choosing a re-reference
+
+| Method | What it subtracts | Typical use |
+| --- | --- | --- |
+| `car` | mean of all good channels | default for decoding and per-channel features |
+| `group_car` | per-group mean | multiple grids/regions - avoids mixing common modes across distant arrays |
+| `median` | median of all good channels | robust variant of CAR when the common mode itself is contaminated |
+| `bipolar` | adjacent channel difference along a shaft | clinical sEEG, epilepsy, HFO detection |
+| `laplacian` | 4-neighbor mean | focal high-gamma mapping / CSD topography; strong spatial high-pass |
+| `shaft_car` | per-shaft mean | depth electrodes |
+| `white_matter` | mean of white-matter contacts | sEEG with identified white-matter contacts |
+| `none` | - | raw monopolar, usually only as a control |
+
+Note that CAR/Laplacian effects are visible in the QC panels (amplitude drop, theta retention,
+signed pairwise correlation), and Laplacian is generally unsuitable for low-frequency oscillation
+or decoding tasks.
+
+## Quality control panels
+
+`plot_protocol_qc` draws a 3x3 English-labeled dashboard: (1) PSD overlay, (2) waveform overlay,
+(3) line-noise peak ratios at 50/100/150 Hz, (4) per-output-row signal retention aligned by
+`out_ch_map`, (5) band power retention, (6) residual common mode (rank-1 variance explained),
+(7) spatial coherence (signed mean pairwise r), (8) per-output-row amplitude with bad channels in
+red, (9) motion/EMG/IED coverage and bad-channel summary. `plot_config_comparison` compares
+multiple protocol evaluations side by side.
+
+Reading order: first line-noise cleanliness and waveform integrity, then signal retention, then
+common-mode/spatial-coherence against the intended spatial high-pass strength, and finally artifact
+and bad-channel summaries.
+
+## Core API
 
 ```python
+import numpy as np
 from preprocessing import (
     PreprocessConfig, run_preprocessing, batch_preprocess, evaluate_config,
     render_protocol_report, plot_protocol_qc, plot_config_comparison,
@@ -121,28 +155,46 @@ cfg = PreprocessConfig(
     reference="car",
 )
 
-# 单段连续数据 (n_ch, n_t)
+# Single continuous recording (n_ch, n_t)
 res = run_preprocessing(X, fs, cfg, stim_onsets=onsets)
 print(render_protocol_report(res["report"]))
 plot_protocol_qc(X, res["data"]["continuous"], fs, report=res["report"])
 
-# 多试次数据 (n_trials, n_ch, n_t)：全局坏通道锁定 + 全量批处理
+# Multi-trial data (n_trials, n_ch, n_t): global bad-channel lock + batch processing
 out = batch_preprocess(X3, fs, cfg, run_kwargs={"groups": groups})
 np.savez("cleaned.npz", X_clean=out["X_clean"], fs=out["fs_out"],
          bad_channels=out["bad_channels"], out_ch_map=out["out_ch_map"])
 
-# 多协议对比评估（每套协议一个 evaluate_config，再画对比面板）
-ev = evaluate_config(X3, fs, cfg, max_trials=30)
+# Protocol comparison across methods
+ev_a = evaluate_config(X3, fs, cfg_car, max_trials=30)
+ev_e = evaluate_config(X3, fs, cfg_group_car, max_trials=30, run_kwargs={"groups": groups})
+plot_config_comparison({"A: car": ev_a, "E: group_car": ev_e})
 ```
 
-数据约定：二维 `(n_ch, n_t)` 或三维 `(n_trials, n_ch, n_t)` 的 numpy float 数组，时间沿最后一维。
-`run_preprocessing` 返回的报告含 `config` 全参数快照、`bad_channels`、`out_ch_map`（输出行 ->
-原始通道索引或双极对）、`motion_frac` / `emg_frac` / `ied_count` / `laplacian_isolated` 等，
-`render_protocol_report` 把它渲染成可读文本，是后续特征提取的复现依据。
+## Data conventions
 
-## 注意事项
+- Input arrays: `(n_ch, n_t)` for continuous data or `(n_trials, n_ch, n_t)` for epoched data,
+  as numpy float arrays with time along the last axis.
+- `.npz` archives use keys `X` and `fs`; channel names and trial metadata are optional.
+- Bandpass upper limits must stay below the Nyquist frequency (no 80-250 Hz ripple analysis on
+  256 Hz data).
+- `drop` changes the channel count: always carry `out_ch_map` into downstream feature extraction.
+- Compare 2-3 protocol configurations per dataset before freezing one.
 
-- 带通上限必须低于奈奎斯特频率；500 Hz 采样可做 80-250 Hz ripple，256 Hz 不行。
-- `drop` 模式会改变通道数，下游特征提取务必携带 `out_ch_map` 记账。
-- 同一批数据建议跑 2-3 套协议对比后固化其一，不要默认一套参数打天下。
-- 本仓库为独立发布版；个人实验目录中的完整项目（notebook、数据、更多布局）不在仓库内。
+## Project structure
+
+```text
+ieeg-preprocess-toolkit/
+├── preprocessing.py        # full pipeline, protocol orchestration, QC metrics and plotting
+├── utils.py                # lightweight loaders, features, phase metrics, chronological evaluation
+├── preprocess_ui.py        # Tkinter desktop UI (imports preprocessing from the same directory)
+├── example_run.py          # headless demo: synthetic data -> report + QC + cleaned .npz
+├── layouts/
+│   └── demo_layout.xlsx    # example 32-channel layout (two 4x4 grids)
+├── README.md
+└── .gitignore
+```
+
+This repository is the standalone release of a personal experimental pipeline. The full lab
+workspace (notebooks, data, additional layouts) is intentionally not included, and no raw or
+cleaned data is tracked by git.
