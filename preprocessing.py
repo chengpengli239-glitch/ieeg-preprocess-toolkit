@@ -44,12 +44,16 @@
                   / motion_lf(慢漂移低通截止, 默认 2Hz)
                   / motion_max_gap(允许修复的最长段, 默认 0.5s)
      emg: none | mask(60-180Hz 肌电包络 MAD 稳健掩码, emg_lo/emg_hi/emg_z/emg_win)
-  6 reference: none | car | median | group_car(分组均值, 多脑区/多栅格)
-               | shaft_car(针道内均值) | white_matter(白质参考)
-               | bipolar(针道内配对) | laplacian(邻接矩阵)
+   6 reference: none | car | median | group_car(分组均值, 多脑区/多栅格)
+                | shaft_car(针道内均值) | white_matter(白质参考)
+                | bipolar(针道内配对) | laplacian(4 邻域邻接矩阵)
+                | laplacian8(8 邻域邻接矩阵, 边缘/角落按实际邻居数归一化)
   7 ied: none | report(发作间期放电检测, 只报告) | exclude(报告并剔除重叠试次)
   8 resample_to: None | 任意目标采样率(多相重采样，自动同步事件)
-  9 events/tmin/tmax/baseline: 事件触发分段 + 可选基线均值校正
+   9 events/tmin/tmax/baseline/cond_labels/evoked_sub:
+       事件触发分段 + 可选基线均值校正 + 诱发成分减除
+       (evoked_sub: none | global 减全体试次平均
+                  | per_condition 按条件标签减各条件内试次平均)
   10 ptp_max/qc_var_z: 段级峰峰与方差 z 分数质检
 
   sEEG 专属：parse_seeg_shafts(针道解析)、detect_ied_spikes(发作间期放电检测，
@@ -825,9 +829,9 @@ def apply_reference(x: np.ndarray, method: str = "none", bad_mask: np.ndarray | 
         if pairs is None:
             raise ValueError("bipolar 参考需要提供 pairs")
         return bipolar_reference(x, compress_pairs(pairs, np.where(bad)[0]))
-    if method == "laplacian":
+    if method in ("laplacian", "laplacian8"):
         if adjacency is None:
-            raise ValueError("laplacian 参考需要提供 adjacency")
+            raise ValueError(f"{method} 参考需要提供 adjacency")
         adj = np.asarray(adjacency, dtype=float).copy()
         adj[:, bad] = 0.0            # 切断坏通道向好通道的扩散
         deg = adj.sum(axis=1)
@@ -858,13 +862,25 @@ def resample(x: np.ndarray, fs: float, target_fs: float) -> tuple[np.ndarray, fl
 
 def make_epochs(x: np.ndarray, fs: float, events: np.ndarray, tmin: float, tmax: float,
                 baseline: tuple[float, float] | None = None,
-                bad_time_mask: np.ndarray | None = None) -> tuple[np.ndarray, list[int]]:
+                bad_time_mask: np.ndarray | None = None,
+                cond_labels: np.ndarray | None = None,
+                evoked_sub: str = "none") -> tuple[np.ndarray, list[int]]:
     """事件触发分段；baseline 为 (t0, t1) 秒，做基线均值校正；
-    bad_time_mask 为时间掩码，与伪迹重叠的试次直接剔除。"""
+    bad_time_mask 为时间掩码，与伪迹重叠的试次直接剔除。
+
+    evoked_sub 诱发成分减除：
+      none           不减除
+      global         减全体保留试次的平均波形（诱发/锁相成分）
+      per_condition  按 cond_labels（与 events 等长的条件标签数组，
+                     如 trialinfo 中的刺激 ID）分组，各试次减本条件内
+                     保留试次的平均波形
+    减除后剩下的就是诱发外（induced）活动——不相位锁定于事件、但对
+    振荡功率/相位动力学有贡献的成分。
+    """
     events = np.asarray(events, dtype=int)
     n_pre, n_post = int(-tmin * fs), int(tmax * fs)
-    epochs, kept = [], []
-    for on in events:
+    epochs, kept, kept_idx = [], [], []
+    for i, on in enumerate(events):
         if on - n_pre < 0 or on + n_post > x.shape[-1]:
             continue
         if bad_time_mask is not None and bad_time_mask[on - n_pre:on + n_post].any():
@@ -876,9 +892,41 @@ def make_epochs(x: np.ndarray, fs: float, events: np.ndarray, tmin: float, tmax:
             seg = seg - seg[:, b0:b1].mean(axis=-1, keepdims=True)
         epochs.append(seg)
         kept.append(int(on))
+        kept_idx.append(i)
     if epochs:
-        return np.stack(epochs), kept
+        epochs = np.stack(epochs)
+        if evoked_sub != "none":
+            labs = None
+            if cond_labels is not None:
+                labs = np.asarray(cond_labels)[kept_idx]
+            epochs = subtract_evoked(epochs, labs, evoked_sub)
+        return epochs, kept
     return np.zeros((0, x.shape[0], n_pre + n_post)), kept
+
+
+def subtract_evoked(epochs: np.ndarray, cond_labels: np.ndarray | None,
+                    mode: str) -> np.ndarray:
+    """诱发成分减除（返回新的 epochs 数组，不修改输入）。
+
+    global：减全体试次平均；per_condition：减各条件内试次平均。
+    平均只用当前保留的试次（边界外/伪迹重叠的试次已剔除）计算，
+    与 MATLAB 版"在选中的成功试次上计算平均"语义一致。
+    """
+    epochs = np.asarray(epochs, dtype=float).copy()
+    n = epochs.shape[0]
+    if mode == "global":
+        return epochs - epochs.mean(axis=0, keepdims=True)
+    if mode == "per_condition":
+        if cond_labels is None:
+            raise ValueError("evoked_sub='per_condition' 需要 cond_labels 条件标签")
+        labs = np.asarray(cond_labels)
+        if len(labs) != n:
+            raise ValueError(f"条件标签数 {len(labs)} 与保留试次数 {n} 不一致")
+        for lab in np.unique(labs):
+            sel = labs == lab
+            epochs[sel] -= epochs[sel].mean(axis=0, keepdims=True)
+        return epochs
+    raise ValueError(f"未知诱发减除方式: {mode}")
 
 
 def epoch_qc_mask(epochs: np.ndarray, ptp_max: float = 800.0,
@@ -968,12 +1016,14 @@ class PreprocessConfig:
     emg_hi: float = 180.0              # EMG 频带上限 (Hz)
     ied: str = "none"                  # none/report/exclude(报告并剔除重叠试次)
     ied_z: float = 5.0                 # IED 包络 z 阈值
-    reference: str = "none"            # none/car/median/shaft_car/white_matter/bipolar/laplacian
+    reference: str = "none"            # none/car/median/group_car/shaft_car/white_matter/bipolar/laplacian/laplacian8
     resample_to: float | None = None
     events: np.ndarray | None = None
     tmin: float = -1.0
     tmax: float = 1.0
     baseline: tuple[float, float] | None = None
+    cond_labels: np.ndarray | None = None   # 与 events 等长的条件标签（如刺激 ID），供 per_condition 诱发减除
+    evoked_sub: str = "none"                # none/global(减全体试次平均)/per_condition(按条件减平均)
     ptp_max: float = 800.0
     qc_var_z: float = 4.0
     detect_kwargs: dict = field(default_factory=dict)
@@ -1043,9 +1093,11 @@ def run_preprocessing(x: np.ndarray, fs: float, cfg: PreprocessConfig,
         "reference": cfg.reference,
         "resample_to": cfg.resample_to,
         "n_events": 0 if cfg.events is None else int(len(np.atleast_1d(cfg.events))),
+        "n_cond_labels": 0 if cfg.cond_labels is None else int(len(np.atleast_1d(cfg.cond_labels))),
         "tmin": cfg.tmin,
         "tmax": cfg.tmax,
         "baseline": None if cfg.baseline is None else [float(v) for v in cfg.baseline],
+        "evoked_sub": cfg.evoked_sub,
         "ptp_max": cfg.ptp_max,
         "qc_var_z": cfg.qc_var_z,
         "detect_kwargs": cfg.detect_kwargs,
@@ -1146,7 +1198,7 @@ def run_preprocessing(x: np.ndarray, fs: float, cfg: PreprocessConfig,
     report["artifact_frac"] = float(artifact_mask.mean())
 
     # 6 重参考（拉普拉斯的孤立节点信息记入报告）
-    if cfg.reference == "laplacian" and adjacency is not None:
+    if cfg.reference in ("laplacian", "laplacian8") and adjacency is not None:
         adj0 = np.asarray(adjacency, dtype=float).copy()
         adj0[:, np.asarray(bad_mask)] = 0.0
         deg = adj0.sum(axis=1)
@@ -1185,7 +1237,10 @@ def run_preprocessing(x: np.ndarray, fs: float, cfg: PreprocessConfig,
     report["qc_mask"] = None
     if events_out is not None:
         epochs, kept = make_epochs(xw, fs_out, events_out, cfg.tmin, cfg.tmax,
-                                   cfg.baseline, artifact_mask)
+                                   cfg.baseline, artifact_mask,
+                                   cond_labels=cfg.cond_labels,
+                                   evoked_sub=cfg.evoked_sub)
+        report["evoked_sub"] = cfg.evoked_sub
         qc = epoch_qc_mask(epochs, cfg.ptp_max, cfg.qc_var_z)
         report["epochs_total"] = len(kept)
         report["epochs_kept"] = int(qc.sum())
@@ -1368,7 +1423,8 @@ def render_protocol_report(report: dict) -> str:
                     if cfg.get('ied') not in (None, 'none') else ""))
     lines.append(f"[8] resampling      : {cfg.get('resample_to') or 'none'}")
     lines.append(f"[9] epoching        : {'none' if cfg.get('n_events') == 0 else str(cfg.get('n_events')) + ' events'}"
-                 f"  (tmin={cfg.get('tmin')}, tmax={cfg.get('tmax')}, baseline={cfg.get('baseline')})")
+                 f"  (tmin={cfg.get('tmin')}, tmax={cfg.get('tmax')}, baseline={cfg.get('baseline')}, "
+                 f"evoked_sub={cfg.get('evoked_sub')}, n_cond_labels={cfg.get('n_cond_labels')})")
     if report.get("epochs_total") is not None:
         lines.append(f"[10] epoch QC       : {report.get('epochs_kept')}/{report.get('epochs_total')} kept"
                      f"  (ptp_max={cfg.get('ptp_max')}, var_z={cfg.get('qc_var_z')})")

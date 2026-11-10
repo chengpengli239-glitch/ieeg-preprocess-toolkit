@@ -21,8 +21,9 @@ artifacts), and did it damage what it should keep (signal retention, spectral co
   original channels (or bipolar pairs), so QC metrics and downstream analysis never misalign.
 - **Global bad-channel locking for multi-trial data**: one mask estimated over the whole session
   and applied to every trial, so outputs always stack into a consistent 3-D tensor.
-- **Eight re-referencing schemes**: common average (CAR), median, grouped CAR, shaft-local CAR,
-  white-matter, bipolar, Laplacian, and none, with Laplacian isolated-node fallback.
+- **Nine re-referencing schemes**: common average (CAR), median, grouped CAR, shaft-local CAR,
+  white-matter, bipolar, 4-neighbor and 8-neighbor Laplacian, and none, with Laplacian
+  isolated-node fallback and degree-based normalization at grid edges/corners.
 - **Line-noise removal** with four algorithms (IIR notch, FIR bandstop, sliding-window spectral
   regression, FFT interpolation repair) supporting a base frequency, harmonics, and arbitrary
   custom frequency lists (e.g., 60 Hz monitor, 65/78/140 Hz device noise).
@@ -35,6 +36,8 @@ artifacts), and did it damage what it should keep (signal retention, spectral co
   (`plot_config_comparison`) to select the right method combination for each dataset.
 - **Tkinter desktop UI** with three-column layout, bad-channel confirmation gating, batch
   processing, and `.npz` export.
+- **Optional evoked subtraction** (`none` / `global` / `per_condition` with condition labels) for
+  induced-activity analyses that are not phase-locked to the event.
 
 ## Installation
 
@@ -100,10 +103,10 @@ bad channels), runs the protocol, and writes the protocol report, the QC dashboa
 | 4 Line noise `line_method` | `none` / `iir_notch` / `fir_notch` / `cleanline` / `fft_interp` | `line_f0`, `line_q`, `line_width`, `line_win`, `line_harmonics`, `line_freqs` | `cleanline` for phase drift; `fft_interp` avoids PSD notches; `line_freqs` for arbitrary device noise |
 | 5 Motion `motion` | `none` / `mask` / `interpolate` | `motion_win`, `motion_z`, `motion_lf`, `motion_max_gap` | masks propagate to epoch QC; median/MAD robust z-scores |
 | 5 EMG `emg` | `none` / `mask` | `emg_lo`, `emg_hi`, `emg_z`, `emg_win` | 60-180 Hz broadband muscle artifacts on temporal/basal contacts |
-| 6 Reference `reference` | `none` / `car` / `median` / `group_car` / `shaft_car` / `white_matter` / `bipolar` / `laplacian` | see below | choose by montage and analysis goal |
+| 6 Reference `reference` | `none` / `car` / `median` / `group_car` / `shaft_car` / `white_matter` / `bipolar` / `laplacian` / `laplacian8` | see below | choose by montage and analysis goal |
 | 7 IED `ied` | `none` / `report` / `exclude` | `ied_z` | `exclude` drops overlapping epochs |
 | 8 Resampling `resample_to` | `None` or target rate | - | polyphase resampling, event coordinates synced |
-| 9 Epoching | `events` / `tmin` / `tmax` / `baseline` | - | epochs overlapping artifact masks are dropped |
+| 9 Epoching | `events` / `tmin` / `tmax` / `baseline` / `cond_labels` / `evoked_sub` | `evoked_sub`: `none` / `global` / `per_condition` | epochs overlapping artifact masks are dropped; evoked subtraction leaves induced activity |
 | 10 Epoch QC | `ptp_max` / `qc_var_z` | - | removes peak-to-peak / variance outliers |
 
 ### Choosing a re-reference
@@ -115,6 +118,7 @@ bad channels), runs the protocol, and writes the protocol report, the QC dashboa
 | `median` | median of all good channels | robust variant of CAR when the common mode itself is contaminated |
 | `bipolar` | adjacent channel difference along a shaft | clinical sEEG, epilepsy, HFO detection |
 | `laplacian` | 4-neighbor mean | focal high-gamma mapping / CSD topography; strong spatial high-pass |
+| `laplacian8` | 8-neighbor mean (incl. diagonals) | same as `laplacian` with a wider kernel; edges/corners normalized by actual neighbor count |
 | `shaft_car` | per-shaft mean | depth electrodes |
 | `white_matter` | mean of white-matter contacts | sEEG with identified white-matter contacts |
 | `none` | - | raw monopolar, usually only as a control |

@@ -25,7 +25,8 @@ from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.abspath(os.path.join(
+    os.path.dirname(__file__), "..", "seeg_public_explore", "src")))
 from preprocessing import (  # noqa: E402
     PreprocessConfig, run_preprocessing, evaluate_config, batch_preprocess,
     detect_bad_vote, parse_seeg_shafts, chain_bipolar_pairs,
@@ -64,6 +65,7 @@ REF_LABELS = {
     "shaft_car - Shaft-local CAR (针道内均值)": "shaft_car",
     "white_matter - White Matter Reference (白质参考)": "white_matter",
     "laplacian - Laplacian Reference (拉普拉斯参考)": "laplacian",
+    "laplacian8 - Laplacian Reference, 8-neighbor (8 邻域拉普拉斯)": "laplacian8",
 }
 IED_LABELS = {
     "none (不检测)": "none",
@@ -225,7 +227,26 @@ def parse_layout_xlsx(path: str, sheet: str) -> dict:
                     nb = (r + dr, c + dc)
                     if nb in grid and nb in block:
                         adj[a, grid[nb] - 1] = 1.0
-    return {"groups": groups, "adjacency": adj,
+    # 8 邻域邻接（含对角线）：边缘/角落通道的邻居数自然减少，
+    # 拉普拉斯按实际邻居数归一化，无需特殊处理
+    adj8 = np.zeros((n_ch, n_ch))
+    if labels:
+        owner = {cell: labels[cell] for cell in grid}
+    else:
+        owner = {}
+        for bi, block in enumerate(blocks):
+            for cell in block:
+                owner[cell] = bi
+
+    for (r, c) in sorted(grid):
+        a = grid[(r, c)] - 1
+        for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1),
+                       (-1, -1), (-1, 1), (1, -1), (1, 1)):
+            nb = (r + dr, c + dc)
+            if nb in grid and owner.get(nb) == owner.get((r, c)):
+                adj8[a, grid[nb] - 1] = 1.0
+
+    return {"groups": groups, "adjacency": adj, "adjacency8": adj8,
             "shafts": shafts if labels else None,
             "n_ch": n_ch, "n_blocks": len(groups)}
 
@@ -242,6 +263,7 @@ class PreprocessUI(tk.Tk):
         self.layout_label_text = "未加载排布表"
         self.ch_names = None
         self.wm_channels = []
+        self.cond_labels = None
         self.last_result = None
         self.last_batch = None
         self._build()
@@ -391,7 +413,7 @@ class PreprocessUI(tk.Tk):
         self.ch_label = ttk.Label(lf2, text="未加载通道名", foreground="gray")
         self.ch_label.pack(side="left")
         self.wm_entry = self._entry_row(mid, "白质触点索引", "", "逗号分隔, 如 3,7,11")
-        ttk.Label(mid, text="group_car/laplacian 需排布表（首列针道名会自动断开跨针道邻接）；"
+        ttk.Label(mid, text="group_car/laplacian/laplacian8 需排布表（首列针道名会自动断开跨针道邻接）；"
                              "bipolar/shaft_car 需通道名；white_matter 需白质触点。").pack(anchor="w", pady=2)
 
         ttk.Separator(mid, orient="horizontal").pack(fill="x", pady=4)
@@ -406,6 +428,13 @@ class PreprocessUI(tk.Tk):
         self.do_epoch = tk.BooleanVar(value=False)
         self.epoch_check = ttk.Checkbutton(mid, variable=self.do_epoch, state="disabled")
         self.epoch_check.pack(anchor="w")
+        self.evoked_sub = self._row(mid, "诱发成分减除", [
+            "none (不减除)", "global (减全体试次平均)",
+            "per_condition (按条件减平均)"], "none (不减除)")
+        lf7 = ttk.Frame(mid); lf7.pack(fill="x", pady=2)
+        ttk.Button(lf7, text="加载条件标签 (.npy)", command=self.load_cond_labels).pack(side="left", padx=4)
+        self.cond_label = ttk.Label(lf7, text="未加载条件标签", foreground="gray")
+        self.cond_label.pack(side="left")
 
         # ============ 右栏：加载 / 运行 / 报告 / 导出 ============
         ttk.Button(right, text="加载数据 (.npy / .npz / demo)", command=self.load).pack(pady=6)
@@ -470,6 +499,15 @@ class PreprocessUI(tk.Tk):
             self.ch_names = [ln.strip() for ln in fh if ln.strip()]
         self.ch_label.config(text=f"{os.path.basename(path)} ({len(self.ch_names)} 通道)",
                              foreground="green")
+
+    def load_cond_labels(self):
+        """加载条件标签（与事件等长的 .npy 数组，如每试次刺激 ID）。"""
+        path = filedialog.askopenfilename(filetypes=[("numpy", "*.npy"), ("all", "*.*")])
+        if not path:
+            return
+        self.cond_labels = np.load(path)
+        self.cond_label.config(text=f"{os.path.basename(path)} ({len(self.cond_labels)} 个)",
+                               foreground="green")
 
     def load_layout(self):
         path = filedialog.askopenfilename(filetypes=[("excel", "*.xlsx")])
@@ -558,11 +596,13 @@ class PreprocessUI(tk.Tk):
                 messagebox.showwarning("提示", "group_car 需要先加载电极排布表")
                 return None, None
             run_kwargs["groups"] = self.layout["groups"]
-        elif ref == "laplacian":
+        elif ref in ("laplacian", "laplacian8"):
             if self.layout is None:
-                messagebox.showwarning("提示", "laplacian 需要先加载电极排布表")
+                messagebox.showwarning("提示", f"{ref} 需要先加载电极排布表")
                 return None, None
-            run_kwargs["adjacency"] = self.layout["adjacency"]
+            run_kwargs["adjacency"] = (self.layout["adjacency8"]
+                                       if ref == "laplacian8"
+                                       else self.layout["adjacency"])
         elif ref == "bipolar":
             if shafts is None:
                 messagebox.showwarning(
@@ -588,6 +628,21 @@ class PreprocessUI(tk.Tk):
         line_freqs = [float(v) for v in
                       self.line_freqs.get().replace("，", ",").replace(" ", "").split(",")
                       if v.strip()]
+        evoked_map = {"none (不减除)": "none",
+                      "global (减全体试次平均)": "global",
+                      "per_condition (按条件减平均)": "per_condition"}
+        evoked_sub = evoked_map[self.evoked_sub.get()]
+        cond_labels = None
+        if self.do_epoch.get() and evoked_sub == "per_condition":
+            n_events = len(np.arange(1, self.data.shape[-1] - 2048, int(self.fs * 5)))
+            if self.cond_labels is None:
+                messagebox.showwarning("提示", "per_condition 诱发减除需要先加载条件标签 (.npy)")
+                return None, None
+            if len(self.cond_labels) != n_events:
+                messagebox.showwarning(
+                    "提示", f"条件标签数 {len(self.cond_labels)} 与事件数 {n_events} 不一致")
+                return None, None
+            cond_labels = self.cond_labels
         cfg = PreprocessConfig(
             dc_method=DC_LABELS[self.dc.get()],
             filter_method=self.f0.get() if self.do_f0.get() else "none",
@@ -624,6 +679,8 @@ class PreprocessUI(tk.Tk):
             ied_z=float(self.ied_z.get()),
             reference=ref,
             resample_to=float(self.resample_to.get()) if self.do_resample.get() else None,
+            evoked_sub=evoked_sub,
+            cond_labels=cond_labels,
         )
         cfg.detect_kwargs["min_votes"] = min_votes
         if self.do_epoch.get():
