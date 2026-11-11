@@ -60,6 +60,58 @@ def power_timecourses(x: np.ndarray, fs: float, fmin: float = 0.5,
     return f[sel], t, power[:, sel, :]
 
 
+def morlet_power(x: np.ndarray, fs: float, fmin: float = 1.0,
+                 fmax: float | None = None, n_freqs: int = 96,
+                 cycles: float = 6.0, hop_sec: float = 0.1
+                 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """复 Morlet 小波功率（频域实现，恒定周期数 + 对数频率网格）。
+
+    为什么用它而不是 STFT：恒定 0.5 s 窗在低频只有 1 个周期，旁瓣泄漏让
+    相邻 bin 的时间进程几乎相同，层次聚类必然把 delta/theta/alpha 粘成
+    一个频段。恒定 cycles（如 6 周/频率）给每个频率相同的相对分辨率，
+    对数网格让低频 bin 密度与高频相当，低频段才有可被聚类分离的结构。
+
+    时间上按 hop_sec 分箱取包络平方均值，返回 (freqs, times, power)。
+    """
+    x = np.asarray(x, dtype=float)
+    fmax = fmax or min(fs / 2 - 1, 100.0)
+    if fmin >= fmax:
+        raise ValueError(f"morlet 频率范围 {fmin}-{fmax} 非法")
+    freqs = np.geomspace(fmin, fmax, int(n_freqs))
+    n_t = x.shape[-1]
+    hop = max(1, int(hop_sec * fs))
+    n_frames = n_t // hop
+    fftfreq = np.fft.rfftfreq(n_t, 1.0 / fs)
+    power = np.zeros((x.shape[0], len(freqs), n_frames))
+    for ci in range(x.shape[0]):
+        xf = np.fft.rfft(x[ci])
+        for fi, f in enumerate(freqs):
+            sigma = f / cycles                      # 频域高斯宽度
+            mask = np.exp(-0.5 * ((fftfreq - f) / sigma) ** 2)
+            y = np.fft.irfft(xf * mask, n=n_t)
+            env = np.abs(y) ** 2
+            power[ci, fi, :] = env[:n_frames * hop].reshape(n_frames, hop).mean(axis=1)
+    times = (np.arange(n_frames) * hop) / fs
+    return freqs, times, power
+
+
+def remove_common_component(M: np.ndarray, rank: int = 1) -> np.ndarray:
+    """从频段×时间矩阵里减掉 rank 阶公共成分（宽带共调制驱动）。
+
+    任务诱发/状态漂移会让所有频段一起升降，相关距离会把它们聚成一个簇。
+    先做 SVD 减掉最强公共成分，剩下的是各频段特异性共波动，频段结构才
+    能被聚类分离。
+    """
+    M = np.asarray(M, dtype=float)
+    Mctr = M - M.mean(axis=1, keepdims=True)
+    U, s, Vt = np.linalg.svd(Mctr, full_matrices=False)
+    rank = int(min(rank, len(s)))
+    if rank <= 0:
+        return Mctr
+    common = (U[:, :rank] * s[:rank]) @ Vt[:rank]
+    return Mctr - common
+
+
 def to_db_relative(power: np.ndarray, baseline_mask: np.ndarray | None = None,
                    baseline_span: tuple[float, float] | None = None,
                    times: np.ndarray | None = None) -> np.ndarray:
@@ -87,6 +139,32 @@ def assemble_freq_matrix(power_db: np.ndarray, channels: list | None = None) -> 
         p = p[np.asarray(channels, dtype=int)]
     n_ch, n_freq, n_time = p.shape
     return p.transpose(1, 0, 2).reshape(n_freq, n_ch * n_time)
+
+
+def assemble_freq_space_matrix(power_db: np.ndarray,
+                               channels: list | None = None) -> np.ndarray:
+    """频率×通道 的空间轮廓矩阵：每个频率一行，值为该频率在时间上的平均 dB
+    功率随通道的分布。按"哪个频段长在哪些通道上"聚类，对低频更有判别力。
+
+    每列（通道）先跨频率做 z 分数：去掉"大声通道在所有频段都响"的共模轴，
+    保留的是"这个通道相对偏好哪些频率"的形状信息。
+    """
+    p = np.asarray(power_db, dtype=float)
+    if channels is not None:
+        p = p[np.asarray(channels, dtype=int)]
+    M = p.mean(axis=-1).T               # (n_freq, n_ch)
+    mu = M.mean(axis=0, keepdims=True)
+    sd = M.std(axis=0, keepdims=True)
+    return (M - mu) / (sd + 1e-12)
+
+
+def flatten_1f(spec: np.ndarray, freqs: np.ndarray) -> np.ndarray:
+    """对对数频率做线性拟合并减去，得到 1/f 展平后的残余谱（峰检测用）。"""
+    freqs = np.asarray(freqs, dtype=float)
+    x = np.log10(np.maximum(freqs, 1e-3))
+    spec = np.asarray(spec, dtype=float)
+    coef = np.polyfit(x, spec, 1)
+    return spec - np.polyval(coef, x)
 
 
 def freq_corr_dist(M: np.ndarray) -> np.ndarray:
@@ -154,27 +232,33 @@ def bootstrap_stability(M: np.ndarray, dist_corr: np.ndarray, k: int,
 def select_k(M: np.ndarray, dist_corr: np.ndarray, k_range: range,
              connectivity: object | None = None, linkage: str = "average",
              n_boot: int = 15, freqs: np.ndarray | None = None,
-             min_band_hz: float = 6.0) -> dict:
+             min_band_hz: float = 4.0, min_band_oct: float = 0.3) -> dict:
     """在 k_range 上比较轮廓系数与稳定性，返回诊断表与最优 k。
 
-    轮廓系数会偏爱碎片化划分；min_band_hz 约束"最窄频段至少多少 Hz"，
+    轮廓系数会偏爱碎片化划分；min_band_hz（线性网格）与 min_band_oct
+    （对数网格，0.3 ≈ 1/3 个八度）约束"最窄频段至少多宽"，
     在满足约束的候选中选轮廓系数最高者。
     """
+    import math
     rows = []
     for k in k_range:
         labels = cluster_freqs(dist_corr, k, connectivity, linkage)
         sil = silhouette_of(dist_corr, labels)
         stab = bootstrap_stability(M, dist_corr, k, connectivity, linkage,
                                    n_boot=n_boot)
-        min_w = np.inf
+        min_w, min_o = np.inf, np.inf
         if freqs is not None:
             df = float(np.median(np.diff(np.asarray(freqs, dtype=float))))
             for b in bands_from_labels(labels, freqs):
                 min_w = min(min_w, b["high"] - b["low"] + df)
+                min_o = min(min_o, math.log2(max(b["high"], 1e-6)
+                                             / max(b["low"], 1e-6)))
         rows.append({"k": k, "silhouette": sil, "stability": stab,
-                     "min_band_hz": min_w, "labels": labels})
+                     "min_band_hz": min_w, "min_band_oct": min_o,
+                     "labels": labels})
     valid = [r for r in rows if not np.isnan(r["silhouette"])]
-    constrained = [r for r in valid if r["min_band_hz"] >= min_band_hz]
+    constrained = [r for r in valid if r["min_band_hz"] >= min_band_hz
+                   and r["min_band_oct"] >= min_band_oct]
     pool = constrained if constrained else valid
     best = max(pool, key=lambda r: r["silhouette"])
     return {"rows": rows,
@@ -198,17 +282,20 @@ def bands_from_labels(labels: np.ndarray, freqs: np.ndarray) -> list[dict]:
     return bands
 
 
-def merge_narrow_bands(bands: list[dict], min_band_hz: float = 6.0) -> list[dict]:
-    """把窄于 min_band_hz 的频段并入带宽更小的相邻频段（迭代至无窄带）。
+def merge_narrow_bands(bands: list[dict], min_band_oct: float = 0.3) -> list[dict]:
+    """把窄于 min_band_oct 个八度的频段并入相邻频段（迭代至无窄带）。
 
     与 EChc 原版"所有 >40 Hz 合并成一段"的硬编码不同，这里只合并窄带，
     且并入哪一侧由相邻带宽决定（更窄的一侧更可能是被过度切分的碎带）。
+    带宽用八度衡量（log2(high/low)），对对数频率网格自洽。
     """
+    import math
     bands = [dict(b) for b in bands]
     while len(bands) > 1:
-        widths = [b["high"] - b["low"] for b in bands]
+        widths = [math.log2(max(b["high"], 1e-6) / max(b["low"], 1e-6))
+                  for b in bands]
         i = int(np.argmin(widths))
-        if widths[i] >= min_band_hz:
+        if widths[i] >= min_band_oct:
             break
         if i == 0:
             j = 1
@@ -226,35 +313,32 @@ def merge_narrow_bands(bands: list[dict], min_band_hz: float = 6.0) -> list[dict
 
 def peak_anchored_bands(power_db: np.ndarray, freqs: np.ndarray,
                         min_prominence: float | None = None,
-                        min_sep_hz: float = 1.5,
-                        max_bands: int = 8) -> list[dict]:
-    """峰锚定频段：平均谱找峰 + 跨通道投票，边界取相邻峰中点。
+                        min_sep_oct: float = 0.12,
+                        max_bands: int = 8,
+                        vote_frac: float = 0.2) -> list[dict]:
+    """峰锚定频段：逐通道峰并集投票 + 对数间隔合并，边界取相邻峰的几何中点。
 
-    显著性阈值自适应（max(min_prominence, 0.3 * 谱 std)），并统计"多少通道
-    在该频率附近有峰"，投票比例低于 0.3 的峰丢弃——单一通道的伪峰不会定界。
+    为什么不用平均谱直接找峰：逐通道的 alpha/beta 峰频率不同，平均后互相
+    抵消，低频背景会把剩下的峰盖住。正确做法是先逐通道做 1/f 展平后找峰，
+    再把"多少通道在相近频率有峰"的投票数作为证据，按对数频率间隔合并。
     """
-    spec = np.asarray(power_db).mean(axis=(0, -1))
-    spec = np.nan_to_num(spec, nan=-np.inf, posinf=-np.inf)
-    thresh = max(min_prominence or 0.0, 0.3 * float(np.nanstd(spec)))
-    peaks, props = sp_signal.find_peaks(
-        spec, prominence=thresh,
-        distance=max(1, int(min_sep_hz / np.median(np.diff(freqs)))))
-    if power_db.ndim == 3:
-        n_ch = power_db.shape[0]
-        votes = []
-        for ch in range(n_ch):
-            cs = np.nan_to_num(power_db[ch].mean(axis=-1), nan=-np.inf, posinf=-np.inf)
-            ch_thresh = max(min_prominence or 0.0, 0.3 * float(np.nanstd(cs)))
-            pk, _ = sp_signal.find_peaks(
-                cs, prominence=ch_thresh,
-                distance=max(1, int(min_sep_hz / np.median(np.diff(freqs)))))
-            votes.append(set(pk.tolist()))
-        keep = [i for i in peaks if sum(1 for v in votes if i in v) / n_ch >= 0.3]
-        if keep:
-            peaks = np.asarray(keep, dtype=int)
-    if len(peaks) > max_bands:
-        keep = np.argsort(props["prominences"])[::-1][:max_bands]
-        peaks = np.sort(peaks[keep])
+    freqs = np.asarray(freqs, dtype=float)
+    from collections import Counter
+    n_ch = power_db.shape[0]
+    votes = Counter()
+    for ch in range(n_ch):
+        cs = np.nan_to_num(power_db[ch].mean(axis=-1), nan=-np.inf, posinf=-np.inf)
+        cs = flatten_1f(cs, freqs)
+        thresh = max(min_prominence or 0.0, 0.15 * float(np.nanstd(cs)))
+        pk, _ = sp_signal.find_peaks(cs, prominence=thresh, distance=1)
+        votes.update(set(pk.tolist()))
+    candidates = sorted((p for p, c in votes.items() if c / n_ch >= vote_frac),
+                        key=lambda p: -votes[p])
+    kept = []
+    for p in candidates:
+        if all(abs(np.log10(freqs[p] / freqs[k])) >= min_sep_oct for k in kept):
+            kept.append(int(p))
+    peaks = np.asarray(sorted(kept[:max_bands]), dtype=int)
     if len(peaks) == 0:
         return [{"low": float(freqs[0]), "high": float(freqs[-1]),
                  "center": float(np.sqrt(freqs[0] * freqs[-1]))}]
@@ -276,11 +360,18 @@ def define_bands(power_db: np.ndarray, freqs: np.ndarray, times: np.ndarray,
                  linkage: str = "average", max_step: int = 1,
                  state_spans: dict | None = None,
                  peak_params: dict | None = None,
-                 min_band_hz: float = 6.0) -> dict:
+                 min_band_hz: float = 4.0,
+                 min_band_oct: float = 0.3,
+                 common_rank: int = 0,
+                 cluster_feature: str = "space") -> dict:
     """频段划分主入口。
 
     state_spans: 可选，{'pre': (t0,t1), 'ictal': (...), ...}（秒），
                  为每个状态分别聚类；None 时对全部时间做一次。
+    common_rank: 仅 "time" 模式可用——聚类前减掉的最强公共成分阶数
+                 （任务诱发让所有频段一起动时用它去粘；默认 0）。
+    cluster_feature: "space"（频率×通道的空间轮廓，默认）| "time"
+                    （频率×通道×时间的共波动，对应 EChc 原版）。
     """
     out = {"freqs": np.asarray(freqs, dtype=float),
            "fixed_bands": FIXED_BANDS}
@@ -293,19 +384,29 @@ def define_bands(power_db: np.ndarray, freqs: np.ndarray, times: np.ndarray,
             sub = define_bands(power_db[..., mask], freqs, times[mask],
                                channels=channels, k_range=k_range,
                                linkage=linkage, max_step=max_step,
-                               peak_params=peak_params, min_band_hz=min_band_hz)
+                               peak_params=peak_params, min_band_hz=min_band_hz,
+                               min_band_oct=min_band_oct,
+                               common_rank=common_rank,
+                               cluster_feature=cluster_feature)
             out["states"][name] = sub["bands"]
         out["bands"] = out["states"][list(out["states"].keys())[0]] if out["states"] else []
         out["peak_bands"] = peak_anchored_bands(power_db, freqs, **(peak_params or {}))
         out["diagnostics"] = {"per_state": {k: v for k, v in out["states"].items()}}
         return out
-    M = assemble_freq_matrix(power_db, channels)
+    if cluster_feature == "space":
+        M = assemble_freq_space_matrix(power_db, channels)
+    elif cluster_feature in ("time", "both"):
+        M = assemble_freq_matrix(power_db, channels)
+    else:
+        raise ValueError(f"未知聚类特征: {cluster_feature}")
+    if common_rank > 0 and cluster_feature != "space":
+        M = remove_common_component(M, common_rank)
     dist = freq_corr_dist(M)
     conn = contiguity_adjacency(M.shape[0], max_step)
     sel = select_k(M, dist, k_range, conn, linkage, freqs=freqs,
-                   min_band_hz=min_band_hz)
+                   min_band_hz=min_band_hz, min_band_oct=min_band_oct)
     raw_bands = bands_from_labels(sel["best_labels"], freqs)
-    bands = merge_narrow_bands(raw_bands, min_band_hz)
+    bands = merge_narrow_bands(raw_bands, min_band_oct)
     peaks = peak_anchored_bands(power_db, freqs, **(peak_params or {}))
     diag = {"best_k": sel["best_k"],
             "table": [{k: r[k] for k in ("k", "silhouette", "stability")}
@@ -347,6 +448,7 @@ def plot_band_definition(result: dict, power_db: np.ndarray, freqs: np.ndarray,
     axes[1].set_xlabel("频率 (Hz)")
     axes[1].set_ylabel("相对功率 (dB)")
     axes[1].set_title("数据驱动频段 vs 固定频段边界（虚线）")
+    axes[1].set_xscale("log")
     axes[1].legend(fontsize=7)
 
     table = result["diagnostics"].get("table", [])
@@ -392,6 +494,7 @@ def plot_state_bands(result: dict, power_db: np.ndarray, freqs: np.ndarray,
         ax.set_title(f"{name} 频段划分")
         ax.set_xlabel("频率 (Hz)")
         ax.set_ylabel("相对功率 (dB)")
+        ax.set_xscale("log")
         ax.legend(fontsize=7)
     fig.tight_layout()
     if save_path is not None:
