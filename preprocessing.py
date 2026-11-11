@@ -1013,11 +1013,13 @@ def run_preprocessing(x: np.ndarray, fs: float, cfg: PreprocessConfig,
         report["bad_vote_detail"] = {}
         report["min_votes"] = None
     elif cfg.bad_detect.startswith("vote:"):
+        detect_kwargs = dict(cfg.detect_kwargs)
+        min_votes = detect_kwargs.pop("min_votes", 2)
         bad, vote_detail = detect_bad_vote(
             xw, fs, cfg.bad_detect[5:].split("+"),
-            cfg.detect_kwargs.get("min_votes", 2), **cfg.detect_kwargs)
+            min_votes, **detect_kwargs)
         report["bad_vote_detail"] = {k: v.tolist() for k, v in vote_detail.items()}
-        report["min_votes"] = cfg.detect_kwargs.get("min_votes", 2)
+        report["min_votes"] = min_votes
     else:
         bad = detect_bad_channels(xw, fs, cfg.bad_detect, **cfg.detect_kwargs)
     bad = np.unique(np.concatenate([bad, np.asarray(cfg.manual_bad, dtype=int)]))
@@ -1487,6 +1489,12 @@ def plot_protocol_qc(x_raw: np.ndarray, x_clean: np.ndarray, fs: float,
     if bad_rows.any():
         ax.bar(chs[bad_rows], m["amp_before"][bad_rows], width=1.0,
                color="red", alpha=0.9, label="bad")
+    isolated = (report or {}).get("laplacian_isolated", [])
+    if isolated:
+        iso = np.asarray([i for i in isolated if 0 <= i < len(chs)], dtype=int)
+        if len(iso):
+            ax.bar(chs[iso], m["amp_before"][iso], width=1.0,
+                   color="orange", alpha=0.9, label="isolated (CAR fallback)")
     ax.set_xlabel("Channel index")
     ax.set_ylabel("Median |amplitude| ($\\mu V$)")
     ax.set_title("8) Per-output-row amplitude (ch-map aligned; red = bad)")
@@ -1661,9 +1669,11 @@ def batch_preprocess(X: np.ndarray, fs: float, cfg: PreprocessConfig,
     if cfg.bad_detect == "none":
         global_bad, detail = np.asarray([], dtype=int), {}
     elif cfg.bad_detect.startswith("vote:"):
+        detect_kwargs = dict(cfg.detect_kwargs)
+        min_votes = detect_kwargs.pop("min_votes", 2)
         global_bad, detail = detect_bad_channels_global(
             X, fs, cfg.bad_detect[5:],
-            cfg.detect_kwargs.get("min_votes", 2), **cfg.detect_kwargs)
+            min_votes, **detect_kwargs)
     else:
         global_bad, detail = detect_bad_channels_global(
             X, fs, cfg.bad_detect, 1, **cfg.detect_kwargs)
@@ -1709,9 +1719,11 @@ def evaluate_config(X: np.ndarray, fs: float, cfg: PreprocessConfig,
     if cfg.bad_detect == "none":
         global_bad = np.asarray([], dtype=int)
     elif cfg.bad_detect.startswith("vote:"):
+        detect_kwargs = dict(cfg.detect_kwargs)
+        min_votes = detect_kwargs.pop("min_votes", 2)
         global_bad, _ = detect_bad_channels_global(
             X, fs, cfg.bad_detect[5:],
-            cfg.detect_kwargs.get("min_votes", 2), **cfg.detect_kwargs)
+            min_votes, **detect_kwargs)
     else:
         global_bad, _ = detect_bad_channels_global(
             X, fs, cfg.bad_detect, 1, **cfg.detect_kwargs)

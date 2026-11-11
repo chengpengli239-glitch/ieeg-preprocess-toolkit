@@ -140,6 +140,28 @@ Reading order: first line-noise cleanliness and waveform integrity, then signal 
 common-mode/spatial-coherence against the intended spatial high-pass strength, and finally artifact
 and bad-channel summaries.
 
+### Bad-channel vote rule: majority-vote vs union
+
+When the five criteria disagree, the choice is visible in the dashboard. On the bundled synthetic
+32-channel grid, `vote:mad+ptp+corr` (2 of 3) flags channels [3, 28], while the union
+`mad+ptp+corr` additionally flags the eight drift-contaminated channels. The panels respond
+measurably: median signal retention r 0.50 (vote) vs 0.83 (union, because the masked rows are
+excluded from the median), residual common mode 86% vs 55%, while theta/gamma band retention stay
+comparable. Recommendation: ship with majority voting (2 of 3) as the default - it removes only
+channels with cross-criterion agreement and leaves ambiguous channels visible in the panels - and
+use the union only for exploratory artifact hunting. The per-criterion results are always stored
+in the report (`bad_vote_detail`) so the decision stays auditable.
+
+### Laplacian isolated-node fallback in the waveform QC
+
+At a degree-2 grid corner whose neighbors are all bad, the Laplacian cannot subtract neighbors and
+falls back to subtracting the good-channel mean (CAR). The resulting trace keeps its amplitude
+instead of being spatially high-passed, so next to its Laplacian-filtered neighbors it can look
+like an out-of-family, low-pass-like waveform - easy to mistake for an artifact. The fallback rows
+are listed in the report (`laplacian_isolated`) and are now highlighted in orange in panel 8 of
+the dashboard. If you do not want these traces, interpolate their neighbors first or exclude the
+rows before downstream analysis.
+
 ## Core API
 
 ```python

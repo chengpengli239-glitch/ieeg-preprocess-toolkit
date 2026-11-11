@@ -124,6 +124,12 @@ stayed".
 Reading order: panels 3 and 2 first (line clean, waveform intact), then 4/5
 (retention), then 6/7 (spatial high-pass strength vs your analysis goal),
 finally 8/9 (bad channels and artifacts).
+
+Bad-channel vote rule: when criteria disagree, majority voting (2 of 3) is
+the recommended default - it removes only cross-criterion agreements and
+keeps ambiguous channels visible in the panels. Use the union for
+exploratory artifact hunting. Panel 8 marks bad rows red and Laplacian
+isolated-node fallback rows orange.
 """
 
 
