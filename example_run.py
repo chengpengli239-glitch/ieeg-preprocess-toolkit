@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
-"""无 UI 命令行示例：生成 demo 数据 -> 跑协议 -> 输出报告/QC 图/清洗结果。
+"""Headless demo: synthetic data -> protocol -> report + QC figure + cleaned npz.
 
-用法：
+Run:
     conda activate bci_env
     python example_run.py
 
-输出（example_output/ 目录，已加入 .gitignore）：
-    protocol_report.txt   协议档案（全部参数与处理结果）
-    qc_single.png         单次运行前后 3x3 QC 面板
-    cleaned_demo.npz      清洗后的多试次数据（X_clean, fs, bad_channels, out_ch_map）
+Outputs (example_output/, git-ignored):
+    protocol_report.txt   full parameter archive
+    qc_single.png         before/after 9-panel QC dashboard
+    cleaned_demo.npz      batch-cleaned trials (X_clean, fs, bad_channels, out_ch_map)
 """
 import os
 import sys
@@ -38,15 +38,17 @@ def main():
         reference="car",
     )
 
-    # 1) 单段连续数据
+    # 1) single continuous recording
     res = run_preprocessing(X, fs, cfg, stim_onsets=demo["stim_onsets"])
     report_text = render_protocol_report(res["report"])
-    with open(os.path.join(OUT_DIR, "protocol_report.txt"), "w", encoding="utf-8") as fh:
+    with open(os.path.join(OUT_DIR, "protocol_report.txt"), "w",
+              encoding="utf-8") as fh:
         fh.write(report_text)
     plot_protocol_qc(X, res["data"]["continuous"], fs, report=res["report"],
                      save_path=os.path.join(OUT_DIR, "qc_single.png"))
 
-    # 2) 多试次批处理（全局坏通道锁定）：两块 4x4 栅格各自分组 CAR
+    # 2) multi-trial batch with a globally locked bad-channel set and
+    #    per-grid group CAR (two 4x4 grids)
     X3 = np.stack([X, X * 0.9, X * 1.1])
     groups = [np.arange(16), np.arange(16, 32)]
     cfg3 = PreprocessConfig(
@@ -63,9 +65,9 @@ def main():
              bad_channels=np.asarray(out["bad_channels"], dtype=int),
              out_ch_map=np.asarray(out["out_ch_map"], dtype=object))
 
-    print("单次运行报告：", res["report"]["shape_out"], "->", report_text.splitlines()[3])
-    print("批处理输出：", out["shape_out"], "| 锁定坏通道：", out["bad_channels"])
-    print("全部输出已写入:", OUT_DIR)
+    print("single run:", res["report"]["shape_out"], "->", report_text.splitlines()[3])
+    print("batch:", out["shape_out"], "| locked bad channels:", out["bad_channels"])
+    print("outputs written to:", OUT_DIR)
 
 
 if __name__ == "__main__":
